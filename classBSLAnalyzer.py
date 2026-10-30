@@ -40,11 +40,12 @@ class BSLAnalyzer:
     """
 
     # ====================== КОНФИГУРАЦИЯ ======================
-    INPUT_DIR = Path("input")
-    OUTPUT_DIR = Path("output")
-    TREES_DIR = Path("trees")
-    BANLIST_FILE = Path("banlist.txt")
-    REPORT_FILE = Path("report.txt")
+    MAIN_DIR = Path("C:/Users/it-pfm/Desktop/python/PythonParser_1c_forObsidian-main")
+    INPUT_DIR = MAIN_DIR / Path("input")
+    OUTPUT_DIR = MAIN_DIR / Path("output")
+    TREES_DIR = MAIN_DIR / Path("trees")
+    BANLIST_FILE = MAIN_DIR / Path("banlist.txt")
+    REPORT_FILE = MAIN_DIR / Path("report.txt")
 
     IDENT = r'[А-Яа-яA-Za-z_][А-Яа-яA-Za-z0-9_]*'
 
@@ -93,10 +94,11 @@ class BSLAnalyzer:
         self.banlist_file = Path(banlist_file) if banlist_file else self.BANLIST_FILE
 
         self.banlist: Set[str] = set()
-        self.code_of: Dict[str, str] = {}           # name_lower → полный код
+        self.code_of: Dict[str, str] = {}                    # name_lower → полный код
         self.calls_from: Dict[str, Set[str]] = defaultdict(set)  # кто → кого вызывает
         self.called_by: Dict[str, Set[str]] = defaultdict(set)   # кого → кто вызывает
-        self.original_names: Dict[str, str] = {}    # name_lower → оригинальный регистр
+        self.original_names: Dict[str, str] = {}             # name_lower → оригинальный регистр
+        self.origin_of: Dict[str, Path] = {}                 # name_lower → Path исходного файла (относительно input_dir)
         self._parsed = False
 
     # ====================== ВСПОМОГАТЕЛЬНЫЕ ======================
@@ -162,13 +164,14 @@ class BSLAnalyzer:
     def parse_all(self) -> None:
         """
         Читает все .txt / .bsl из input/,
-        строит code_of, calls_from, called_by, original_names.
+        строит code_of, calls_from, called_by, original_names, origin_of.
         """
         self.banlist = self.load_banlist()
         self.code_of.clear()
         self.calls_from.clear()
         self.called_by.clear()
         self.original_names.clear()
+        self.origin_of.clear()
 
         if not self.input_dir.exists():
             print(f"Папка {self.input_dir} не найдена")
@@ -181,12 +184,16 @@ class BSLAnalyzer:
 
         for path in files:
             text = path.read_text(encoding="utf-8")
+            rel = path.relative_to(self.input_dir)
+
             for m in self.PROC_FUNC_RE.finditer(text):
                 name = m.group("name")
                 name_lower = name.lower()
                 full_code = m.group("header") + m.group("body") + m.group("footer")
+
                 self.code_of[name_lower] = full_code
                 self.original_names[name_lower] = name
+                self.origin_of[name_lower] = rel
 
                 called = self.extract_calls(m.group("body"))
                 called_lower = {c.lower() for c in called}
@@ -292,7 +299,6 @@ class BSLAnalyzer:
 
     def parse(
         self,
-        create_unknown: bool = True,
         report_file: Path | str | None = None,
     ) -> None:
         """
@@ -314,8 +320,8 @@ class BSLAnalyzer:
             for md in self.output_dir.rglob("*.md"):
                 rel = md.relative_to(self.output_dir)
                 if len(rel.parts) >= 2:
-                        key = str(rel.with_suffix("")).replace("\\", "/").lower()
-                        global_created.add(key)
+                    key = str(rel.with_suffix("")).replace("\\", "/").lower()
+                    global_created.add(key)
 
         files = list(self.input_dir.rglob("*.txt")) + list(self.input_dir.rglob("*.bsl"))
         if not files:
@@ -366,27 +372,6 @@ class BSLAnalyzer:
                 if found:
                     report.append(f"     вызовы: {', '.join(found)}")
 
-            if create_unknown:
-                unknown = []
-                for name in sorted(all_marked):
-                    name_lower = name.lower()
-                    key = f"{target_dir}/{name}".lower()
-                    if name_lower in created_in_this_file or key in global_created:
-                        continue
-                    out_path = target_dir / f"{name}.md"
-                    content = (
-                        "#НеизвестнаяФункция\n\n"
-                        "// Эта функция была вызвана, но исходный код не найден.\n"
-                    )
-                    if self._write_md(out_path, content, skip_existing=True):
-                        report.append(f"  → [НЕИЗВЕСТНАЯ] создан пустой {target_dir}/{name}.md")
-                        unknown.append(name)
-                        global_created.add(key)
-                if unknown:
-                    report.append(f"  Неизвестные функции: {', '.join(unknown)}")
-            else:
-                report.append("  Создание файлов неизвестных функций пропущено")
-
         report_path = Path(report_file) if report_file else self.REPORT_FILE
         report_path.write_text("\n".join(report), encoding="utf-8")
         print(f"\nГотово. Отчёт: {report_path}")
@@ -399,6 +384,7 @@ class BSLAnalyzer:
         Режим tree_down.py:
         создаёт папку trees/tree_down_<Имя>/ с файлами
         самой функции и всех, кого она вызывает (рекурсивно).
+        Структура папок повторяет исходные файлы (как в parse).
         """
         self.ensure_parsed()
 
@@ -423,19 +409,25 @@ class BSLAnalyzer:
 
         display_name = self.original_names.get(name_lower, name)
         folder = self.trees_dir / f"tree_down_{display_name}"
-        folder.mkdir(parents=True, exist_ok=True)
 
         print(f"\nСоздаём {len(to_create)} файлов в «{folder}»:")
         for n in sorted(to_create):
             code = self.code_of.get(n)
             if not code:
-                content = "#НеизвестнаяФункция\n\n// Код функции не найден\n"
-            else:
-                content = self.make_file_content(code, self.calls_from.get(n, set()))
+                continue
 
-            out = folder / f"{self.original_names.get(n, n)}.md"
+            content = self.make_file_content(code, self.calls_from.get(n, set()))
+
+            origin = self.origin_of.get(n)
+            if origin is not None:
+                target_dir = folder / origin.parent / origin.stem
+            else:
+                target_dir = folder
+
+            out = target_dir / f"{self.original_names.get(n, n)}.md"
+            out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(content, encoding="utf-8")
-            print(f"  → {out.name}")
+            print(f"  → {out.relative_to(folder)}")
 
         print("\nГотово.")
 
@@ -446,6 +438,7 @@ class BSLAnalyzer:
         Режим tree_up.py:
         создаёт папку trees/tree_up_<Имя>/ с файлами
         самой функции и всех, кто её вызывает (рекурсивно).
+        Структура папок повторяет исходные файлы (как в parse).
         """
         self.ensure_parsed()
 
@@ -475,19 +468,25 @@ class BSLAnalyzer:
 
         display_name = self.original_names.get(name_lower, name)
         folder = self.trees_dir / f"tree_up_{display_name}"
-        folder.mkdir(parents=True, exist_ok=True)
 
         print(f"\nСоздаём {len(to_create)} файлов в «{folder}»:")
         for n in sorted(to_create):
             code = self.code_of.get(n)
             if not code:
-                content = "#НеизвестнаяФункция\n\n// Код функции не найден\n"
-            else:
-                content = self.make_file_content(code, self.calls_from.get(n, set()))
+                continue
 
-            out = folder / f"{self.original_names.get(n, n)}.md"
+            content = self.make_file_content(code, self.calls_from.get(n, set()))
+
+            origin = self.origin_of.get(n)
+            if origin is not None:
+                target_dir = folder / origin.parent / origin.stem
+            else:
+                target_dir = folder
+
+            out = target_dir / f"{self.original_names.get(n, n)}.md"
+            out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(content, encoding="utf-8")
-            print(f"  → {out.name}")
+            print(f"  → {out.relative_to(folder)}")
 
         print("\nГотово.")
 
@@ -724,12 +723,7 @@ class BSLAnalyzer:
         choice = input("Выберите режим [1/2/3/4/5/0]: ").strip()
 
         if choice == "1":
-            create_unknown = self.ask_yes_no(
-                "Создавать пустые файлы для неизвестных функций с тегом #НеизвестнаяФункция?",
-                default=True,
-            )
-            print(f"→ {'Будем' if create_unknown else 'Не будем'} создавать файлы неизвестных функций\n")
-            self.parse(create_unknown=create_unknown)
+            self.parse()
 
         elif choice == "2":
             self.tree_down()
@@ -749,4 +743,3 @@ class BSLAnalyzer:
         else:
             print("Неизвестный выбор.")
         return True
-
